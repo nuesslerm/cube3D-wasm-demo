@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport"
+        content="width=device-width, initial-scale=1.0, maximum-scale=1.0,
+                 user-scalable=no, viewport-fit=cover">
+  <title>cub3D — WASM</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      width: 100%; height: 100%;
+      background: #000;
+      overflow: hidden;
+      touch-action: none; /* prevent scroll / pinch-zoom */
+      font-family: 'Courier New', monospace;
+    }
+
+    /* Game canvas — fills viewport, preserves aspect ratio */
+    #view {
+      position: fixed; inset: 0;
+      width: 100%; height: 100%;
+      object-fit: contain;
+      image-rendering: pixelated;
+      touch-action: none;
+    }
+
+    /* ── Loading / error overlays ─────────────────────────────────── */
+    #loading {
+      position: fixed; inset: 0; z-index: 50;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      background: #0d0d14; color: #9aa0b0; gap: 14px;
+    }
+    #loading h1 { font-size: 1.6rem; letter-spacing: .15em; color: #c8cfe0; }
+    #loading p  { font-size: .8rem; opacity: .7; }
+    .spinner {
+      width: 36px; height: 36px;
+      border: 3px solid #2a2d40; border-top-color: #6a80c0;
+      border-radius: 50%; animation: spin .8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    #error {
+      position: fixed; inset: 0; z-index: 60;
+      display: none; align-items: center; justify-content: center;
+      background: #0d0d14; color: #e06060;
+      font-size: 1rem; text-align: center; padding: 2rem;
+    }
+
+    /* ── HUD ──────────────────────────────────────────────────────── */
+    #hud {
+      position: fixed; bottom: max(18px, env(safe-area-inset-bottom));
+      left: 50%; transform: translateX(-50%);
+      background: rgba(0,0,0,.55); backdrop-filter: blur(6px);
+      color: #8a90a8; font-size: .7rem; letter-spacing: .04em;
+      padding: 7px 18px; border-radius: 20px;
+      border: 1px solid rgba(255,255,255,.07);
+      pointer-events: none; display: none; z-index: 20;
+      white-space: nowrap;
+    }
+    #hud span { color: #a8b4d0; }
+
+    #badge {
+      position: fixed; top: max(14px, env(safe-area-inset-top)); right: 14px;
+      background: rgba(0,0,0,.55); backdrop-filter: blur(6px);
+      color: #6a80c0; font-size: .65rem; letter-spacing: .08em;
+      padding: 5px 12px; border-radius: 12px;
+      border: 1px solid rgba(106,128,192,.35);
+      pointer-events: none; display: none; z-index: 20;
+    }
+
+    /* ── Minimap ──────────────────────────────────────────────────── */
+    #minimap {
+      position: fixed;
+      top: max(14px, env(safe-area-inset-top));
+      left: 14px;
+      border-radius: 6px; border: 1px solid rgba(255,255,255,.12);
+      image-rendering: pixelated; display: none; z-index: 20;
+      /* On small screens shrink the minimap */
+      max-width: 30vw; max-height: 30vw;
+    }
+
+    /* ── Virtual joystick controls ────────────────────────────────── */
+    /* Two full-height half-screen touch zones sit above everything   */
+    .ctrl-zone {
+      position: fixed; top: 0; bottom: 0;
+      width: 50%; z-index: 10;
+      /* no background — game shows through */
+    }
+    #zone-left  { left: 0; }
+    #zone-right { right: 0; }
+
+    /* Joystick ring + dot — hidden until a touch starts */
+    .stick-ring {
+      position: fixed;         /* positioned in viewport coords */
+      width: 110px; height: 110px;
+      border-radius: 50%;
+      border: 2px solid rgba(255,255,255,.3);
+      background: rgba(0,0,0,.25);
+      backdrop-filter: blur(4px);
+      transform: translate(-50%, -50%);
+      pointer-events: none;
+      display: none;
+      z-index: 11;
+    }
+    .stick-dot {
+      position: absolute;
+      width: 48px; height: 48px; border-radius: 50%;
+      background: rgba(255,255,255,.45);
+      top: 50%; left: 50%;
+      /* dot offset is applied via --dx / --dy custom props */
+      transform: translate(calc(-50% + var(--dx, 0px)),
+                           calc(-50% + var(--dy, 0px)));
+    }
+
+    /* Hint labels shown briefly inside each zone */
+    .zone-hint {
+      position: absolute;
+      bottom: 20%; left: 50%; transform: translateX(-50%);
+      color: rgba(255,255,255,.18); font-size: .65rem;
+      letter-spacing: .08em; pointer-events: none;
+      transition: opacity .5s;
+    }
+  </style>
+</head>
+<body>
+
+<canvas id="view"></canvas>
+
+<div id="loading">
+  <h1>cub3D</h1>
+  <div class="spinner"></div>
+  <p>Compiling WebAssembly…</p>
+</div>
+<div id="error"></div>
+
+<canvas id="minimap"></canvas>
+
+<!-- Touch control zones (full height, split left / right) -->
+<div class="ctrl-zone" id="zone-left">
+  <div class="zone-hint" id="hint-left">MOVE</div>
+</div>
+<div class="ctrl-zone" id="zone-right">
+  <div class="zone-hint" id="hint-right">LOOK</div>
+</div>
+
+<!-- Joystick rings (one per hand, repositioned on touchstart) -->
+<div class="stick-ring" id="ring-left"><div class="stick-dot"></div></div>
+<div class="stick-ring" id="ring-right"><div class="stick-dot"></div></div>
+
+<div id="hud"></div>
+<div id="badge">C → WASM · DDA raycaster</div>
+
+<script src="cub3d.js"></script>
+<script type="module">
+
+/* ── Map data ───────────────────────────────────────────────────── */
+const MAP_DATA =
+`NO ./textures/north.xpm
+SO ./textures/south.xpm
+WE ./textures/west.xpm
+EA ./textures/east.xpm
+
+F 112,128,144
+C 50,50,80
+
+1111111111111111111
+1000000000000000001
+1000000000000000001
+1000011100011000001
+1000010000011000001
+1000010000000000001
+100001000N000000001
+1000010000000000001
+1000011111110000001
+1000000000000000001
+1000000001000000001
+1000000001000000001
+1111111111111111111
+`;
+
+/* ── Key bitmask (must match wasm_bridge.c) ─────────────────────── */
+const WKEY = { W:1, S:2, A:4, D:8, LEFT:16, RIGHT:32 };
+
+/* ── Keyboard input (desktop) ───────────────────────────────────── */
+const KEY_MAP = {
+  w:WKEY.W, arrowup:WKEY.W,
+  s:WKEY.S, arrowdown:WKEY.S,
+  a:WKEY.A, d:WKEY.D,
+  arrowleft:WKEY.LEFT, arrowright:WKEY.RIGHT,
+};
+const held = {};
+window.addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (k in KEY_MAP) { held[k] = true; e.preventDefault(); }
+});
+window.addEventListener('keyup', e => { held[e.key.toLowerCase()] = false; });
+function kbdMask() {
+  let m = 0;
+  for (const [k, bit] of Object.entries(KEY_MAP)) if (held[k]) m |= bit;
+  return m;
+}
+
+/* ── Mouse-look (desktop, pointer lock) ─────────────────────────── */
+let mouseAccum = 0;
+const ROT_STEP = 8;
+document.addEventListener('click', () => {
+  if (!isTouchDevice()) document.body.requestPointerLock();
+});
+document.addEventListener('mousemove', e => {
+  if (document.pointerLockElement) mouseAccum += e.movementX;
+});
+function isTouchDevice() {
+  return navigator.maxTouchPoints > 0;
+}
+
+/* ── Virtual joystick state ─────────────────────────────────────── */
+const STICK_R = 60; // max deflection radius in px
+const DEAD    = 0.20;
+
+const joy = {
+  left:  { active: false, id: -1, ox: 0, oy: 0, ndx: 0, ndy: 0 },
+  right: { active: false, id: -1, ox: 0, oy: 0, ndx: 0, ndy: 0 },
+};
+
+function stickStart(side, touch) {
+  const j = joy[side];
+  if (j.active) return;
+  j.active = true; j.id = touch.identifier;
+  j.ox = touch.clientX; j.oy = touch.clientY;
+  j.ndx = 0; j.ndy = 0;
+  const ring = document.getElementById(`ring-${side}`);
+  ring.style.left = touch.clientX + 'px';
+  ring.style.top  = touch.clientY + 'px';
+  ring.style.display = 'block';
+  ring.querySelector('.stick-dot').style.setProperty('--dx', '0px');
+  ring.querySelector('.stick-dot').style.setProperty('--dy', '0px');
+  // hide hint after first use
+  const hint = document.getElementById(`hint-${side}`);
+  if (hint) { hint.style.opacity = '0'; }
+}
+
+function stickMove(side, touch) {
+  const j = joy[side];
+  if (j.id !== touch.identifier) return;
+  let dx = touch.clientX - j.ox;
+  let dy = touch.clientY - j.oy;
+  const len = Math.hypot(dx, dy);
+  if (len > STICK_R) { dx = dx / len * STICK_R; dy = dy / len * STICK_R; }
+  j.ndx = dx / STICK_R;
+  j.ndy = dy / STICK_R;
+  const dot = document.getElementById(`ring-${side}`).querySelector('.stick-dot');
+  dot.style.setProperty('--dx', dx + 'px');
+  dot.style.setProperty('--dy', dy + 'px');
+}
+
+function stickEnd(side, touch) {
+  const j = joy[side];
+  if (j.id !== touch.identifier) return;
+  j.active = false; j.id = -1; j.ndx = 0; j.ndy = 0;
+  document.getElementById(`ring-${side}`).style.display = 'none';
+}
+
+function bindZone(zoneId, side) {
+  const el = document.getElementById(zoneId);
+  el.addEventListener('touchstart', e => {
+    e.preventDefault();
+    for (const t of e.changedTouches) stickStart(side, t);
+  }, { passive: false });
+  el.addEventListener('touchmove', e => {
+    e.preventDefault();
+    for (const t of e.changedTouches) stickMove(side, t);
+  }, { passive: false });
+  el.addEventListener('touchend', e => {
+    e.preventDefault();
+    for (const t of e.changedTouches) stickEnd(side, t);
+  }, { passive: false });
+  el.addEventListener('touchcancel', e => {
+    e.preventDefault();
+    for (const t of e.changedTouches) stickEnd(side, t);
+  }, { passive: false });
+}
+
+bindZone('zone-left',  'left');
+bindZone('zone-right', 'right');
+
+/* Compute the full key mask each frame from all input sources */
+function inputMask() {
+  let keys = kbdMask();
+
+  // Mouse look (desktop)
+  if (mouseAccum >  ROT_STEP) { keys |= WKEY.RIGHT; mouseAccum -= ROT_STEP; }
+  if (mouseAccum < -ROT_STEP) { keys |= WKEY.LEFT;  mouseAccum += ROT_STEP; }
+
+  // Left joystick → WASD
+  const { ndx: lx, ndy: ly } = joy.left;
+  if (ly < -DEAD) keys |= WKEY.W;
+  if (ly >  DEAD) keys |= WKEY.S;
+  if (lx < -DEAD) keys |= WKEY.A;
+  if (lx >  DEAD) keys |= WKEY.D;
+
+  return keys;
+}
+
+/* Right joystick gives analog rotation: larger deflection = more ticks */
+function rightRotTicks() {
+  const rx = joy.right.ndx;
+  if (Math.abs(rx) <= DEAD) return { ticks: 0, bit: 0 };
+  const ticks = Math.ceil((Math.abs(rx) - DEAD) / (1 - DEAD) * 4); // 1-4
+  return { ticks, bit: rx > 0 ? WKEY.RIGHT : WKEY.LEFT };
+}
+
+/* ── Error helper ───────────────────────────────────────────────── */
+function showError(msg) {
+  const el = document.getElementById('error');
+  el.textContent = msg; el.style.display = 'flex';
+}
+
+/* ── WASM boot ──────────────────────────────────────────────────── */
+let wmod;
+try { wmod = await CubModule(); }
+catch (e) { showError('WASM load failed: ' + e.message); throw e; }
+
+const wasm = {
+  init:        wmod.cwrap('wasm_init',          'number', ['string']),
+  loadTexture: wmod.cwrap('wasm_load_texture',  'number', ['number','string']),
+  tick:        wmod.cwrap('wasm_tick',          null,     ['number']),
+  fbPtr:       wmod.cwrap('wasm_fb_ptr',        'number', []),
+  fbW:         wmod.cwrap('wasm_fb_width',      'number', []),
+  fbH:         wmod.cwrap('wasm_fb_height',     'number', []),
+  mapW:        wmod.cwrap('wasm_map_width',     'number', []),
+  mapH:        wmod.cwrap('wasm_map_height',    'number', []),
+  cell:        wmod.cwrap('wasm_map_cell',      'number', ['number','number']),
+  px:          wmod.cwrap('wasm_player_x',      'number', []),
+  py:          wmod.cwrap('wasm_player_y',      'number', []),
+  pdx:         wmod.cwrap('wasm_player_dir_x',  'number', []),
+  pdy:         wmod.cwrap('wasm_player_dir_y',  'number', []),
+};
+
+if (wasm.init(MAP_DATA) !== 0) {
+  showError('C map parser (WASM) rejected the scene file.'); throw new Error();
+}
+
+/* ── Textures ───────────────────────────────────────────────────── */
+document.querySelector('#loading p').textContent = 'Loading textures…';
+await Promise.all([
+  [0, './textures/north.xpm'],
+  [1, './textures/south.xpm'],
+  [2, './textures/east.xpm'],
+  [3, './textures/west.xpm'],
+].map(([face, url]) =>
+  fetch(url)
+    .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.text(); })
+    .then(text => wasm.loadTexture(face, text))
+    .catch(e => console.warn(`Texture ${url}: ${e.message}`))
+));
+
+/* ── Canvas 2D blit ─────────────────────────────────────────────── */
+const FBW = wasm.fbW(), FBH = wasm.fbH();
+const fbPtr = wasm.fbPtr();
+
+const canvas = document.getElementById('view');
+canvas.width = FBW; canvas.height = FBH;
+const ctx = canvas.getContext('2d');
+const imgData = ctx.createImageData(FBW, FBH);
+
+function blitFramebuffer() {
+  imgData.data.set(new Uint8Array(wmod.HEAPU8.buffer, fbPtr, FBW * FBH * 4));
+  ctx.putImageData(imgData, 0, 0);
+}
+
+/* ── Minimap ─────────────────────────────────────────────────────── */
+const CELL = 6;
+const MAP_W = wasm.mapW(), MAP_H = wasm.mapH();
+const mm = document.getElementById('minimap');
+mm.width = MAP_W * CELL; mm.height = MAP_H * CELL;
+Object.assign(mm.style, { width: MAP_W*CELL+'px', height: MAP_H*CELL+'px' });
+const mmCtx = mm.getContext('2d');
+
+const mapGrid = new Uint8Array(MAP_W * MAP_H);
+for (let r = 0; r < MAP_H; r++)
+  for (let c = 0; c < MAP_W; c++)
+    mapGrid[r * MAP_W + c] = wasm.cell(c, r);
+
+function drawMinimap() {
+  const px = wasm.px(), py = wasm.py(), dx = wasm.pdx(), dy = wasm.pdy();
+  mmCtx.clearRect(0, 0, MAP_W*CELL, MAP_H*CELL);
+  for (let r = 0; r < MAP_H; r++)
+    for (let c = 0; c < MAP_W; c++) {
+      mmCtx.fillStyle = mapGrid[r*MAP_W+c] ? '#4a4e60' : '#1a1d28';
+      mmCtx.fillRect(c*CELL, r*CELL, CELL, CELL);
+    }
+  const sx = px*CELL, sy = py*CELL;
+  mmCtx.fillStyle = '#6aacff';
+  mmCtx.beginPath(); mmCtx.arc(sx, sy, 2.5, 0, Math.PI*2); mmCtx.fill();
+  mmCtx.strokeStyle = '#6aacff'; mmCtx.lineWidth = 1.5;
+  mmCtx.beginPath(); mmCtx.moveTo(sx, sy);
+  mmCtx.lineTo(sx + dx*10, sy + dy*10); mmCtx.stroke();
+}
+
+/* ── Main loop ───────────────────────────────────────────────────── */
+function animate() {
+  requestAnimationFrame(animate);
+
+  // Analog rotation from right joystick (extra ticks = faster turn)
+  const { ticks, bit } = rightRotTicks();
+  for (let i = 0; i < ticks; i++) wasm.tick(bit);
+
+  wasm.tick(inputMask());
+  blitFramebuffer();
+  drawMinimap();
+}
+
+/* ── HUD: different text for touch vs mouse ──────────────────────── */
+const hud = document.getElementById('hud');
+if (isTouchDevice()) {
+  hud.innerHTML =
+    '<span>Left</span> joystick: move &nbsp;·&nbsp; <span>Right</span> joystick: look';
+} else {
+  hud.innerHTML =
+    '<span>WASD</span> move &nbsp;·&nbsp; <span>← →</span> rotate &nbsp;·&nbsp;' +
+    ' <span>Click</span> mouse-look';
+}
+
+/* ── Reveal UI ───────────────────────────────────────────────────── */
+wasm.tick(0);
+document.getElementById('loading').style.display = 'none';
+hud.style.display     = 'block';
+document.getElementById('badge').style.display   = 'block';
+mm.style.display = 'block';
+animate();
+</script>
+</body>
+</html>
